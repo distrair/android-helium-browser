@@ -1,124 +1,56 @@
-name: Build
+name: Build Helium Browser (Depot Remote Execution)
 
 on:
-  workflow_dispatch:
-    inputs:
-      runner:
-        description: 'Runner'
-        required: true
-        type: string
-        default: 'ubuntu-latest' # ubuntu-latest
-  schedule:
-    - cron: '0 0 */16 * *'
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: write
+  push:
+    branches: [ main ]
+  workflow_dispatch: 
 
 jobs:
   build:
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner || 'self-hosted' }}
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-          filter: 'blob:none'
-          fetch-depth: 1
-
-      - name: Cache depot_tools
-        uses: actions/cache@v5
-        with:
-          path: depot_tools
-          key: depot-tools-${{ runner.os }}
-          restore-keys: |
-            depot-tools-${{ runner.os }}-
-
-      - name: Cache Chromium dependencies
-        uses: actions/cache@v5
-        with:
-          path: |
-            # Cache only lightweight Chromium metadata; avoid chromium/src/third_party
-            # as it can be tens of GB and exceed GitHub Actions cache limits.
-            chromium/.gclient_entries
-          key: chromium-deps-${{ runner.os }}-${{ hashFiles('vanadium/args.gn') }}
-          restore-keys: |
-            chromium-deps-${{ runner.os }}-
-
-      - name: Optimize APT mirrors
-        uses: vegardit/fast-apt-mirror.sh@v1
-        with:
-          healthchecks: 10
-          speedtests: 5
-          parallel_downloads: 8
-          cache_apt_lists: true
-
-      - name: Free up disk space
-        uses: endersonmenezes/free-disk-space@v3
-        with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-          remove_swap: true
-          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* mysql* dotnet-sdk-*"
-          remove_packages_one_command: true
-          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle /opt/ghc /usr/share/dotnet /usr/local/lib/android /opt/hostedtoolcache /var/lib/man-db/auto-update /usr/local/.ghcup /var/lib/apt/lists/*"
-          rm_cmd: "rmz"
-
-      - name: Additional cleanup
-        run: |
-          sudo apt-get clean -yq 2>/dev/null || true
-          sudo apt-get autoclean -y 2>/dev/null || true
-          sudo apt-get autoremove --purge -yq 2>/dev/null || true
-          sudo journalctl --rotate && sudo journalctl --vacuum-time=1s 2>/dev/null || true
-          sudo rm -rf /var/cache/apt/archives/ 2>/dev/null || true
-          df -h
-
-      - name: Update 
-        run: |
-          cd vanadium
-          git fetch --tags
-          git checkout $(git tag | sort -V | tail -n1)
-          cd ..
-          git add vanadium
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          if ! git diff --staged --quiet; then
-            git commit -am "update"
-            git push
-          fi
-
-      - name: Set ENV
-        run: | 
-          chmod +x *.sh
-          echo "unix_time=$(date +%s)" >> $GITHUB_ENV
+    runs-on: depot-ubuntu-22.04-8
     
-      - name: Build
-        env:
-            DEBIAN_FRONTEND: noninteractive
-            LOCAL_TEST_JKS: ${{ secrets.LOCAL_TEST_JKS }}
-            STORE_TEST_JKS: ${{ secrets.STORE_TEST_JKS }}
-        run: |
-          ./build.sh
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Set
-        run: |
-          export VERSION=$(find chromium/src/out/release -name '*arm64-v8a.apk' | sed 's/.*\///;s/\-arm64-v8a.apk$//')
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          mv $(find chromium/src/out/release -name '*arm64-v8a.apk') $VERSION-${{ env.unix_time }}-arm64-v8a.apk
-          mv $(find chromium/src/out/release -name '*armeabi-v7a.apk') $VERSION-${{ env.unix_time }}-armeabi-v7a.apk
+      - name: Setup Depot CLI
+        uses: depot/setup-action@v1
 
-      - name: Publish
-        uses: softprops/action-gh-release@v2
+      - name: Free Disk Space (Only needed for GitHub runners)
+        if: runner.environment == 'github-hosted'
+        uses: jlumbroso/free-disk-space@main
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          name: v${{ env.VERSION }}
-          tag_name: v${{ env.VERSION }}
-          draft: true
-          files: |
-            ${{ env.VERSION }}-${{ env.unix_time }}-arm64-v8a.apk
-            ${{ env.VERSION }}-${{ env.unix_time }}-armeabi-v7a.apk
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Setup Depot Tools (Chromium toolchain)
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$(pwd)/depot_tools" >> $GITHUB_PATH
+
+      - name: Fetch Chromium Source & Apply Patches
+        run: |
+          # This script is specific to your Helium project
+          python3 clone.py
+
+      - name: Generate Ninja Build Files
+        working-directory: src
+        run: |
+          gn gen out/Default --args='target_os="android" target_cpu="arm64" is_debug=false'
+
+      - name: Build with Depot Remote Execution
+        env:
+          DEPOT_PROJECT_ID: ${{ secrets.DEPOT_PROJECT_ID }}
+          DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        working-directory: src
+        run: |
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Helium-Browser-APK
+          path: src/out/Default/apks/*.apk
